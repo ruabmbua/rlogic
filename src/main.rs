@@ -59,9 +59,9 @@ fn main() -> ! {
 
     let bus = usb::UsbBus::new(usb);
     let mut usb_dev = UsbDeviceBuilder::new(&bus, UsbVidPid(0xdead, 0xbeef))
-        .manufacturer("Fake company")
-        .product("Logic analyzer")
-        .serial_number("1")
+        .manufacturer("ruabmbua")
+        .product("rlogic")
+        // .serial_number("1")
         .device_class(0x03)
         .build();
 

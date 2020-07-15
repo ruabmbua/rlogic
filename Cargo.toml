@@ -1,5 +1,5 @@
 [package]
-name = "logic-analyzer"
+name = "rlogic"
 version = "0.1.0"
 authors = ["Roland Ruckerbauer <roland.rucky@gmail.com>"]
 edition = "2018"
@@ -15,7 +15,7 @@ nb = "1.0.0"
 usb-device = "0.2.5"
 
 [[bin]]
-name = "logic-analyzer"
+name = "rlogic"
 path = "src/main.rs"
 test = false
 bench = false
