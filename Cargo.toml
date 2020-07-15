@@ -1,0 +1,27 @@
+[package]
+name = "logic-analyzer"
+version = "0.1.0"
+authors = ["Roland Ruckerbauer <roland.rucky@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+stm32f1xx-hal = { version = "0.6.1", features = [ "stm32f103", "stm32-usbd" ] }
+cortex-m = "0.6.2"
+cortex-m-rt = "0.6.12"
+embedded-hal = "0.2.4"
+nb = "1.0.0"
+usb-device = "0.2.5"
+
+[[bin]]
+name = "logic-analyzer"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+debug = true
+lto = true
