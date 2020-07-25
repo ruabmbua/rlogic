@@ -6,7 +6,6 @@ use core::panic::PanicInfo;
 use cortex_m::asm;
 use cortex_m_rt::{entry, exception};
 use embedded_hal::digital::v2::OutputPin;
-use nb::block;
 use pac::{Interrupt, NVIC};
 use stm32f1xx_hal::{
     gpio::State,
@@ -74,9 +73,9 @@ fn main() -> ! {
 
         let bus = USB_BUS.as_ref().unwrap();
 
-        USB_CAPTURE = Some(Capture::new(bus, 16));
+        USB_CAPTURE = Some(Capture::new(bus, 128));
 
-        let mut usb_dev = UsbDeviceBuilder::new(bus, UsbVidPid(0xdead, 0xbeef))
+        let usb_dev = UsbDeviceBuilder::new(bus, UsbVidPid(0xdead, 0xbeef))
             .manufacturer("ruabmbua")
             .product("rlogic")
             // .serial_number("1")
@@ -105,7 +104,7 @@ fn main() -> ! {
 
 struct Capture<'a, B: UsbBus> {
     comm_if: InterfaceNumber,
-    comm_ep: EndpointIn<'a, B>,
+    comm_ep: EndpointOut<'a, B>,
     data_if: InterfaceNumber,
     write_ep: EndpointIn<'a, B>,
 }
@@ -114,9 +113,22 @@ impl<B: UsbBus> Capture<'_, B> {
     fn new(alloc: &UsbBusAllocator<B>, max_packet_size: u16) -> Capture<'_, B> {
         Capture {
             comm_if: alloc.interface(),
-            comm_ep: alloc.interrupt(8, 255),
+            comm_ep: alloc.interrupt(32, 255),
             data_if: alloc.interface(),
+            // read_ep: alloc.interrupt(32, 255),
             write_ep: alloc.bulk(max_packet_size),
+        }
+    }
+
+    fn poll(&mut self) {
+        let mut buf = [0; 32];
+
+        match self.comm_ep.read(&mut buf) {
+            Ok(n) => {
+                self.write_ep.write(&buf[..n]).unwrap();
+            }
+            Err(UsbError::WouldBlock) => {}
+            Err(_) => {}
         }
     }
 }
@@ -147,9 +159,7 @@ fn USB_LP_CAN_RX0() {
 }
 
 #[exception]
-fn SysTick() {
-
-}
+fn SysTick() {}
 
 fn usb_interrupt() {
     let usb_dev = unsafe { USB_DEV.as_mut().unwrap() };
@@ -158,6 +168,8 @@ fn usb_interrupt() {
     if !usb_dev.poll(&mut [capture_class]) {
         return;
     }
+
+    capture_class.poll();
 }
 
 #[panic_handler]
