@@ -1,18 +1,28 @@
 #![no_std]
 #![no_main]
+#![feature(asm)]
+
+mod protocol;
 
 use asm::delay;
-use core::panic::PanicInfo;
-use cortex_m::asm;
+use core::{cell::RefCell, mem, panic::PanicInfo};
+use cortex_m::{
+    asm,
+    interrupt::{free as interrupt_free, CriticalSection, Mutex},
+};
 use cortex_m_rt::{entry, exception};
-use embedded_hal::digital::v2::OutputPin;
-use pac::{Interrupt, NVIC};
+use embedded_hal::digital::v2::{InputPin, OutputPin};
+use mem::MaybeUninit;
+use pac::{Interrupt, NVIC, TIM2};
+use protocol::Command;
 use stm32f1xx_hal::{
-    gpio::State,
+    gpio::{Input, PullDown, Pxx, State},
     pac,
     pac::interrupt,
     prelude::*,
-    timer::{Event, Timer},
+    rcc::{Clocks, APB1},
+    time::Hertz,
+    timer::{CountDownTimer, Event, Timer},
     usb,
 };
 use usb_device::bus::UsbBusAllocator;
@@ -21,9 +31,73 @@ use usb_device::{
     device::{UsbDevice, UsbDeviceBuilder, UsbVidPid},
 };
 
+struct LogicAnalyzer {
+    capture_timer: CaptureTimer,
+    clocks_config: Clocks,
+    apb1_bus: APB1,
+    pins: [Pxx<Input<PullDown>>; 4],
+    samples: [u8; 64],
+    sample_offset: u8,
+    lost_samples: u32,
+}
+
+impl LogicAnalyzer {
+    fn start_capture(&mut self, freq: Hertz) {
+        self.lost_samples = 0;
+        self.sample_offset = 0;
+        self.capture_timer
+            .start(freq, &self.clocks_config, &mut self.apb1_bus);
+    }
+
+    fn stop_capture(&mut self) {
+        self.capture_timer.stop();
+    }
+
+    unsafe fn get(cs: &CriticalSection) -> &'static mut LogicAnalyzer {
+        &mut *LOGIC_ANALYZER.borrow(cs).borrow_mut().as_mut_ptr()
+    }
+}
+
+enum CaptureTimer {
+    Uninit,
+    Enabled(CountDownTimer<TIM2>),
+    Disabled(TIM2),
+}
+
+impl CaptureTimer {
+    fn start(&mut self, freq: Hertz, clocks: &Clocks, apb1: &mut APB1) {
+        let mut other = CaptureTimer::Uninit;
+
+        mem::swap(self, &mut other);
+
+        if let CaptureTimer::Disabled(tim) = other {
+            let mut timer = Timer::tim2(tim, clocks, apb1).start_count_down(freq);
+            timer.listen(Event::Update);
+            *self = CaptureTimer::Enabled(timer);
+        } else {
+            mem::swap(self, &mut other);
+        }
+    }
+
+    fn stop(&mut self) {
+        let mut other = CaptureTimer::Uninit;
+
+        mem::swap(self, &mut other);
+
+        if let CaptureTimer::Enabled(mut count_down) = other {
+            count_down.unlisten(Event::Update);
+            *self = CaptureTimer::Disabled(count_down.release());
+        } else {
+            mem::swap(self, &mut other);
+        }
+    }
+}
+
 static mut USB_BUS: Option<UsbBusAllocator<usb::UsbBusType>> = None;
 static mut USB_DEV: Option<UsbDevice<usb::UsbBusType>> = None;
 static mut USB_CAPTURE: Option<Capture<usb::UsbBusType>> = None;
+static LOGIC_ANALYZER: Mutex<RefCell<MaybeUninit<LogicAnalyzer>>> =
+    Mutex::new(RefCell::new(MaybeUninit::uninit()));
 
 #[entry]
 fn main() -> ! {
@@ -42,8 +116,6 @@ fn main() -> ! {
 
     assert!(clock_cfg.usbclk_valid());
 
-    let mut timer = Timer::syst(core_peripherals.SYST, &clock_cfg).start_count_down(5.hz());
-
     // Get LED
     let mut gpioc = peripherals.GPIOC.split(&mut rcc.apb2);
     let mut led = gpioc
@@ -60,6 +132,14 @@ fn main() -> ! {
 
     let dp = dp.into_floating_input(&mut gpioa.crh);
 
+    // Digital inputs
+    let dios = [
+        gpioa.pa0.into_pull_down_input(&mut gpioa.crl).downgrade(),
+        gpioa.pa1.into_pull_down_input(&mut gpioa.crl).downgrade(),
+        gpioa.pa2.into_pull_down_input(&mut gpioa.crl).downgrade(),
+        gpioa.pa3.into_pull_down_input(&mut gpioa.crl).downgrade(),
+    ];
+
     let usb = usb::Peripheral {
         usb: peripherals.USB,
         pin_dm: dm,
@@ -73,7 +153,7 @@ fn main() -> ! {
 
         let bus = USB_BUS.as_ref().unwrap();
 
-        USB_CAPTURE = Some(Capture::new(bus, 128));
+        USB_CAPTURE = Some(Capture::new(bus, 64));
 
         let usb_dev = UsbDeviceBuilder::new(bus, UsbVidPid(0xdead, 0xbeef))
             .manufacturer("ruabmbua")
@@ -86,9 +166,30 @@ fn main() -> ! {
 
         NVIC::unmask(Interrupt::USB_HP_CAN_TX);
         NVIC::unmask(Interrupt::USB_LP_CAN_RX0);
+        NVIC::unmask(Interrupt::TIM2);
     }
 
+    let mut timer = Timer::syst(core_peripherals.SYST, &clock_cfg).start_count_down(5.hz());
+
     timer.listen(Event::Update);
+
+    let capture_timer = peripherals.TIM2;
+    let apb1 = rcc.apb1;
+
+    interrupt_free(|cs| {
+        let mut logic_analyzer = LOGIC_ANALYZER.borrow(cs).borrow_mut();
+        unsafe {
+            logic_analyzer.as_mut_ptr().write(LogicAnalyzer {
+                capture_timer: CaptureTimer::Disabled(capture_timer),
+                clocks_config: clock_cfg,
+                apb1_bus: apb1,
+                pins: dios,
+                lost_samples: 0,
+                samples: [0u8; 64],
+                sample_offset: 0,
+            });
+        }
+    });
 
     loop {
         match timer.wait() {
@@ -123,10 +224,16 @@ impl<B: UsbBus> Capture<'_, B> {
     fn poll(&mut self) {
         let mut buf = [0; 32];
 
-        match self.comm_ep.read(&mut buf) {
-            Ok(n) => {
-                self.write_ep.write(&buf[..n]).unwrap();
-            }
+        match self.comm_ep.read(&mut buf[..5]) {
+            Ok(_n) => match Command::parse(&buf[..5]) {
+                Some(Command::Start(freq)) => {
+                    interrupt_free(|cs| unsafe { LogicAnalyzer::get(cs) }.start_capture(freq))
+                }
+                Some(Command::Stop) => {
+                    interrupt_free(|cs| unsafe { LogicAnalyzer::get(cs) }.stop_capture())
+                }
+                None => {}
+            },
             Err(UsbError::WouldBlock) => {}
             Err(_) => {}
         }
@@ -156,6 +263,45 @@ fn USB_HP_CAN_TX() {
 #[interrupt]
 fn USB_LP_CAN_RX0() {
     usb_interrupt();
+}
+
+#[interrupt]
+fn TIM2() {
+    interrupt_free(|cs| {
+        let logic_analyzer = unsafe { LogicAnalyzer::get(cs) };
+        let capture_class = unsafe { USB_CAPTURE.as_mut().unwrap() };
+
+        let mut val = 0;
+
+        for (i, pin) in logic_analyzer.pins.iter().enumerate() {
+            val |= if pin.is_high().unwrap() { 1 } else { 0 } << i;
+        }
+
+        let buf_size = logic_analyzer.samples.len();
+
+        if logic_analyzer.sample_offset < buf_size as u8 - 4 {
+            logic_analyzer.samples[logic_analyzer.sample_offset as usize] = val;
+            logic_analyzer.sample_offset += 1;
+        } else {
+            let lost_sample_bytes = logic_analyzer.lost_samples.to_le_bytes();
+
+            logic_analyzer.samples[buf_size - 4..].copy_from_slice(&lost_sample_bytes);
+
+            match capture_class.write_ep.write(&logic_analyzer.samples) {
+                Ok(_) => {
+                    logic_analyzer.sample_offset = 0;
+                    logic_analyzer.lost_samples = 0;
+                }
+                Err(_) => {
+                    logic_analyzer.lost_samples += 1;
+                }
+            }
+        }
+
+        if let CaptureTimer::Enabled(tim) = &mut logic_analyzer.capture_timer {
+            tim.wait().unwrap();
+        }
+    });
 }
 
 #[exception]
