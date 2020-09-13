@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![feature(asm)]
 
 mod protocol;
 
@@ -206,7 +205,6 @@ fn main() -> ! {
 struct Capture<'a, B: UsbBus> {
     comm_if: InterfaceNumber,
     comm_ep: EndpointOut<'a, B>,
-    data_if: InterfaceNumber,
     write_ep: EndpointIn<'a, B>,
 }
 
@@ -215,8 +213,6 @@ impl<B: UsbBus> Capture<'_, B> {
         Capture {
             comm_if: alloc.interface(),
             comm_ep: alloc.interrupt(32, 255),
-            data_if: alloc.interface(),
-            // read_ep: alloc.interrupt(32, 255),
             write_ep: alloc.bulk(max_packet_size),
         }
     }
@@ -247,8 +243,6 @@ impl<B: UsbBus> UsbClass<B> for Capture<'_, B> {
     ) -> usb_device::Result<()> {
         writer.interface(self.comm_if, 0xff, 0xff, 0)?;
         writer.endpoint(&self.comm_ep)?;
-
-        writer.interface(self.data_if, 0xff, 0xff, 0)?;
         writer.endpoint(&self.write_ep)?;
 
         Ok(())

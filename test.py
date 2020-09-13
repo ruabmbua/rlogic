@@ -14,24 +14,20 @@ dev.set_configuration()
 
 cfg = dev.get_active_configuration()
 
-intf_control = cfg[(0, 0)]
-intf_data = cfg[(1, 0)]
+intf = cfg[(0, 0)]
 
-# print(intf_control)
-# print(intf_data)
-
-ep_control = usb.util.find_descriptor(intf_control, custom_match=lambda e: usb.util.endpoint_direction(
+ep_control = usb.util.find_descriptor(intf, custom_match=lambda e: usb.util.endpoint_direction(
     e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
 
 
-ep_data = usb.util.find_descriptor(intf_data, custom_match=lambda e: usb.util.endpoint_direction(
+ep_data = usb.util.find_descriptor(intf, custom_match=lambda e: usb.util.endpoint_direction(
     e.bEndpointAddress) == usb.util.ENDPOINT_IN)
 
 
 assert ep_control is not None
+assert ep_data is not None
 
 print("connected")
-
 
 def start_capture(freq):
     packet = struct.pack("<bI", 0x01, freq)
@@ -47,8 +43,6 @@ def print_values():
     while True:
         packet = ep_data.read(64, timeout=0xffffffff)
         n = len(packet)
-        # for i in range(n - 4):
-        #     print("{}".format(packet[i]))
 
         lost = struct.unpack("<I", packet[n - 4:n])
         lost = lost[0]
@@ -61,7 +55,6 @@ sample_idx = 0
 start_capture(1000)
 
 plt.ion()
-# plt.show()
 
 y = [[], [], [], []]
 x = [[], [], [], []]
@@ -87,8 +80,5 @@ while True:
 
 
     plt.pause(0.02)
-
-    # for i in range(n - 4):
-    #     print("{}".format(packet[i]))
 
     sample_idx += n - 4
